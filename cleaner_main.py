@@ -32,6 +32,21 @@ from tkinter import messagebox
 IS_WINDOWS = (os.name == "nt")
 
 # ----------------------------------------------------------------------------
+# 黑匣子日志（exe 无窗口模式下排错用）
+# ----------------------------------------------------------------------------
+LOG_PATH = os.path.join(os.environ.get("TEMP", os.path.expanduser("~/tmp")),
+                        "C盘清理大师.log")
+
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + str(msg) + "\n")
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
 # 常量与颜色
 # ----------------------------------------------------------------------------
 APP_TITLE = "C盘清理大师"
@@ -817,6 +832,8 @@ class CleanerApp:
         )
         tk.Label(page, text=tips, bg=C_PAGE_BG, fg=C_TEXT_MAIN,
                  font=self.f_norm, justify="left").pack(pady=16)
+        tk.Label(page, text="排错日志：%s" % LOG_PATH,
+                 bg=C_PAGE_BG, fg=C_TEXT_SUB, font=self.f_small).pack()
         if IS_WINDOWS and not is_admin():
             tk.Button(page, text="以管理员身份重启", font=self.f_norm,
                       bg=C_ORANGE, fg="white", relief="flat", cursor="hand2",
@@ -846,7 +863,8 @@ class CleanerApp:
         if self.scanning:
             return
         self.scanning = True
-        self.slim_hdr["btn"].configure(state="disabled")
+        log("start_scan: begin (demo=%s)" % self.demo)
+        self.slim_hdr["btn"].configure(state="disabled", text="扫描中…")
         self.slim_hdr["scan"].configure(text="正在扫描…")
         self.slim_hdr["title"].configure(text="正在扫描垃圾文件…")
 
@@ -866,10 +884,15 @@ class CleanerApp:
 
         def worker():
             try:
-                self.q.put(("disk", *disk_usage()))
-                for it in CLEAN_ITEMS:
+                log("scan worker: started")
+                du = disk_usage()
+                if du:
+                    self.q.put(("disk", du[0], du[1]))
+                total_n = len(CLEAN_ITEMS)
+                for idx, it in enumerate(CLEAN_ITEMS, 1):
                     iid = it["id"]
-                    self.q.put(("scanpath", it["name"], ""))
+                    log("scan: [%d/%d] %s" % (idx, total_n, it["name"]))
+                    self.q.put(("scanprogress", idx, total_n, it["name"]))
                     if it.get("special") == "recycle":
                         sz = scan_recycle_bin_size()
                         self.q.put(("item", iid, sz, [], ""))
@@ -878,15 +901,23 @@ class CleanerApp:
                     cb = lambda root, n=it["name"]: self.q.put(
                         ("scanpath", n, root))
                     sz, files = scan_dir_tree(paths, progress_cb=cb)
+                    log("scan done [%d/%d] %s = %s, %d files"
+                        % (idx, total_n, it["name"], fmt_size(sz), len(files)))
                     self.q.put(("item", iid, sz, files, ""))
+                log("scan worker: all done")
                 self.q.put(("done", True))
             except Exception:
-                self.q.put(("error", traceback.format_exc()))
+                tb = traceback.format_exc()
+                log("scan worker CRASH:\n" + tb)
+                self.q.put(("error", tb))
 
         threading.Thread(target=worker, daemon=True).start()
 
     # ======================= 清理 =======================
     def on_clean_clicked(self):
+        log("clean clicked: scanning=%s cleaning=%s" % (self.scanning, self.cleaning))
+        if self.scanning or self.cleaning:
+            return
         ids = [iid for iid, d in self.items.items()
                if d["checked"] and d["size"] > 0]
         if not ids:
@@ -904,36 +935,45 @@ class CleanerApp:
         def worker():
             freed = 0
             failed = 0
-            for iid in ids:
-                d = self.items[iid]
-                name = d["defn"]["name"]
-                self.q.put(("cleaning", name))
-                files = d["files"]
-                if d["defn"].get("special") == "recycle":
-                    # 回收站：调用清空
-                    freed += d["size"]
-                    if IS_WINDOWS:
-                        try:
-                            ctypes.windll.shell32.SHEmptyRecycleBinW(
-                                None, "C:\\", 7)  # 无确认+无声音+不弹UI
-                        except Exception:
-                            failed += 1
+            try:
+                for iid in ids:
+                    d = self.items[iid]
+                    name = d["defn"]["name"]
+                    log("cleaning item: %s (%d files, %s)"
+                        % (name, len(d["files"]), fmt_size(d["size"])))
+                    self.q.put(("cleaning", name))
+                    files = d["files"]
+                    if d["defn"].get("special") == "recycle":
+                        # 回收站：调用清空
+                        freed += d["size"]
+                        if IS_WINDOWS:
+                            try:
+                                ctypes.windll.shell32.SHEmptyRecycleBinW(
+                                    None, "C:\\", 7)  # 无确认+无声音+不弹UI
+                            except Exception:
+                                failed += 1
+                        d["size"] = 0
+                        d["files"] = []
+                        self.q.put(("item", iid, 0, [], ""))
+                        continue
+                    if not files:
+                        continue
+                    ok = send_to_recycle_bin(files)
+                    log("cleaned item: %s ok=%s" % (name, ok))
+                    if ok:
+                        freed += d["size"]
+                    else:
+                        failed += len(files)
                     d["size"] = 0
                     d["files"] = []
                     self.q.put(("item", iid, 0, [], ""))
-                    continue
-                if not files:
-                    continue
-                before_dirs = set()
-                ok = send_to_recycle_bin(files)
-                if ok:
-                    freed += d["size"]
-                else:
-                    failed += len(files)
-                d["size"] = 0
-                d["files"] = []
-                self.q.put(("item", iid, 0, [], ""))
-            self.q.put(("cleandone", freed, failed))
+                log("clean worker: done, freed=%s failed=%d"
+                    % (fmt_size(freed), failed))
+                self.q.put(("cleandone", freed, failed))
+            except Exception:
+                tb = traceback.format_exc()
+                log("clean worker CRASH:\n" + tb)
+                self.q.put(("cleanerror", tb))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -953,6 +993,9 @@ class CleanerApp:
                             total / 1e9, free / 1e9)
                         self.slim_hdr["disk_text"].configure(text=t)
                         self.big_hdr["disk_text"].configure(text=t)
+                elif kind == "scanprogress":
+                    self.slim_hdr["scan"].configure(
+                        text="正在扫描 (%d/%d): %s …" % (msg[1], msg[2], msg[3]))
                 elif kind == "scanpath":
                     txt = msg[1] if not msg[2] else "%s: %s" % (
                         msg[1], msg[2])
@@ -1007,9 +1050,16 @@ class CleanerApp:
                     else:
                         messagebox.showwarning(
                             APP_TITLE, "部分文件清理失败（可能被占用）")
+                elif kind == "cleanerror":
+                    self.cleaning = False
+                    self.refresh_item_cards()
+                    self.slim_hdr["btn"].configure(text="一键瘦身")
+                    self.slim_hdr["scan"].configure(text="清理出错")
+                    messagebox.showerror(APP_TITLE, "清理出错：\n" + msg[1])
                 elif kind == "error":
                     self.scanning = False
                     self.slim_hdr["scan"].configure(text="扫描出错")
+                    self.slim_hdr["btn"].configure(text="一键瘦身")
                     messagebox.showerror(APP_TITLE, "扫描出错：\n" + msg[1])
         except queue.Empty:
             pass
@@ -1035,7 +1085,19 @@ def main():
         print("SELFTEST OK")
         return
     root = tk.Tk()
-    CleanerApp(root)
+    try:
+        log("app start: %s %s (admin=%s)"
+            % (sys.platform, sys.version.split()[0], is_admin()))
+        CleanerApp(root)
+    except Exception:
+        tb = traceback.format_exc()
+        log("app start CRASH:\n" + tb)
+        try:
+            messagebox.showerror(APP_TITLE,
+                                 "启动出错：\n" + tb + "\n\n日志文件：%s" % LOG_PATH)
+        except Exception:
+            pass
+        raise
     root.mainloop()
 
 
